@@ -12,8 +12,9 @@ from fastapi.responses import JSONResponse
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Import speech-to-text module
+# Import custom modules
 import stt
+import text_to_image
 
 # Load environment variables
 load_dotenv()
@@ -44,6 +45,83 @@ def get_llm_client():
         temperature=0.7,
         groq_api_key=GROQ_API_KEY
     )
+
+def upload_whatsapp_media(file_path: str, mime_type: str = "image/jpeg"):
+    """Upload a media file to WhatsApp servers and return the media ID"""
+    if not all([WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
+        logger.error("WhatsApp credentials not set")
+        raise ValueError("WhatsApp credentials not set")
+    
+    try:
+        # API endpoint for uploading media
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/media"
+        
+        # Open the file and prepare the request
+        with open(file_path, "rb") as file_data:
+            file_content = file_data.read()
+        
+        # Prepare the files parameter with the correct format
+        files = {
+            "messaging_product": (None, "whatsapp"),
+            "file": (os.path.basename(file_path), file_content, mime_type)
+        }
+        
+        # Send the file upload request
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}"
+        }
+        
+        response = requests.post(url, files=files, headers=headers)
+        response.raise_for_status()
+        
+        # Return the media ID
+        data = response.json()
+        logger.info(f"Media upload response: {data}")
+        return data.get("id")
+    
+    except Exception as e:
+        logger.error(f"Error uploading media to WhatsApp: {e}")
+        raise ValueError(f"Error uploading media: {str(e)}")
+
+
+def send_whatsapp_image(to: str, image_id: str, caption: str = ""):
+    """Send an image message to a WhatsApp user"""
+    if not all([WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
+        logger.error("WhatsApp credentials not set")
+        raise ValueError("WhatsApp credentials not set")
+    
+    try:
+        # API endpoint for sending messages
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+        
+        # Prepare the request payload
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "image",
+            "image": {
+                "id": image_id,
+                "caption": caption
+            }
+        }
+        
+        # Send the request
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        logger.info(f"Image sent successfully to {to}")
+        return response.json()
+    
+    except Exception as e:
+        logger.error(f"Error sending image via WhatsApp: {e}")
+        raise ValueError(f"Error sending image: {str(e)}")
+
 
 def send_whatsapp_message(to: str, message: str):
     """Send a message to WhatsApp user"""
@@ -184,16 +262,36 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 
                                 # Handle different message types
                                 if message.get("type") == "text":
-                                    # Process text message
+                                    # Get the message text
                                     message_text = message["text"]["body"]
-                                    logger.info(f"Message from {sender_id}: {message_text}")
                                     
-                                    # Process the message in the background
-                                    background_tasks.add_task(
-                                        process_text_message, 
-                                        sender_id, 
-                                        message_text
-                                    )
+                                    # Check if this is an image generation command
+                                    if message_text.startswith("/image"):
+                                        prompt = message_text[7:].strip()  # Remove '/image ' from the start
+                                        logger.info(f"Image generation request from {sender_id}: {prompt}")
+                                        
+                                        if not prompt:
+                                            send_whatsapp_message(
+                                                sender_id, 
+                                                "Please provide a prompt after /image. Example: /image a beautiful sunset over mountains"
+                                            )
+                                        else:
+                                            # Process the image generation in the background
+                                            background_tasks.add_task(
+                                                process_image_generation,
+                                                sender_id,
+                                                prompt
+                                            )
+                                    else:
+                                        # Process regular text message
+                                        logger.info(f"Message from {sender_id}: {message_text}")
+                                        
+                                        # Process the message in the background
+                                        background_tasks.add_task(
+                                            process_text_message, 
+                                            sender_id, 
+                                            message_text
+                                        )
                                 
                                 elif message.get("type") == "audio" or message.get("type") == "voice":
                                     # Process audio/voice message
@@ -216,6 +314,36 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
             status_code=500,
             content={"status": "error", "message": f"Error processing webhook: {str(e)}"}
         )
+
+def process_image_generation(sender_id: str, prompt: str):
+    """Process image generation request and send image back to user"""
+    try:
+        # Send a message indicating that image generation is in progress
+        send_whatsapp_message(sender_id, "Generating your image... Please wait.")
+        
+        # Generate the image using the Text-to-Image module
+        _, image_path = text_to_image.generate_image_from_prompt(prompt)
+        logger.info(f"Generated image at path: {image_path}")
+        
+        # Upload the image to WhatsApp's servers
+        media_id = upload_whatsapp_media(image_path)
+        logger.info(f"Uploaded image to WhatsApp, media ID: {media_id}")
+        
+        # Send the image to the user
+        send_whatsapp_image(sender_id, media_id, f"Image generated from: {prompt}")
+        logger.info(f"Image sent to {sender_id}")
+        
+        # Clean up the temporary file
+        try:
+            os.remove(image_path)
+            logger.info(f"Removed temporary image file: {image_path}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary image file: {e}")
+    
+    except Exception as e:
+        logger.error(f"Error processing image generation: {e}")
+        send_whatsapp_message(sender_id, f"Sorry, I couldn't generate your image. Error: {str(e)}")
+
 
 if __name__ == "__main__":
     # Validate environment variables before starting
