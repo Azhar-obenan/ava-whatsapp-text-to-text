@@ -12,6 +12,9 @@ from fastapi.responses import JSONResponse
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
+# Import speech-to-text module
+import stt
+
 # Load environment variables
 load_dotenv()
 
@@ -27,6 +30,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Initialize LLM client
 def get_llm_client():
@@ -70,8 +74,8 @@ def send_whatsapp_message(to: str, message: str):
         logger.error(f"Error sending WhatsApp message: {e}")
         return None
 
-def process_message(sender_id: str, message_text: str):
-    """Process incoming message and generate a response"""
+def get_groq_response(message_text: str) -> str:
+    """Generate a response using the Groq LLM"""
     try:
         # Initialize LLM
         llm = get_llm_client()
@@ -89,14 +93,46 @@ def process_message(sender_id: str, message_text: str):
         ]
         
         response = llm.invoke(messages)
+        return response.content
+    except Exception as e:
+        logger.error(f"Error generating response: {e}")
+        return "I'm sorry, I'm having trouble processing your request right now."
+
+def process_text_message(sender_id: str, message_text: str):
+    """Process incoming text message and generate a response"""
+    try:
+        # Generate response using LLM
+        response_text = get_groq_response(message_text)
         
         # Send the response back to the user
-        send_whatsapp_message(sender_id, response.content)
-        
+        send_whatsapp_message(sender_id, response_text)
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
+        logger.error(f"Error processing text message: {e}")
         # Send an error message to the user
-        send_whatsapp_message(sender_id, "I'm sorry, I'm having trouble processing your request right now.")
+        send_whatsapp_message(sender_id, "I'm sorry, I'm having trouble processing your text message right now.")
+
+def process_audio_message(sender_id: str, media_id: str):
+    """Process incoming audio/voice message and generate a response"""
+    try:
+        # First, transcribe the audio
+        logger.info(f"Processing voice message from {sender_id} with media ID: {media_id}")
+        
+        # Use STT module to transcribe audio
+        transcript = stt.process_voice_message(media_id, WHATSAPP_TOKEN)
+        logger.info(f"Transcription: {transcript}")
+        
+        if transcript:
+            # Generate response to the transcribed text
+            response_text = get_groq_response(transcript)
+            
+            # Send the response back to the user
+            send_whatsapp_message(sender_id, response_text)
+        else:
+            send_whatsapp_message(sender_id, "I couldn't understand your voice message. Could you please try again?")
+    except Exception as e:
+        logger.error(f"Error processing audio message: {e}")
+        # Send an error message to the user
+        send_whatsapp_message(sender_id, "I'm sorry, I'm having trouble processing your voice message right now.")
 
 @app.get("/")
 async def root():
@@ -143,18 +179,32 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     for change in entry["changes"]:
                         if "value" in change and "messages" in change["value"]:
                             for message in change["value"]["messages"]:
+                                # Extract sender ID
+                                sender_id = message["from"]
+                                
+                                # Handle different message types
                                 if message.get("type") == "text":
-                                    # Extract sender and message information
-                                    sender_id = message["from"]
+                                    # Process text message
                                     message_text = message["text"]["body"]
-                                    
                                     logger.info(f"Message from {sender_id}: {message_text}")
                                     
                                     # Process the message in the background
                                     background_tasks.add_task(
-                                        process_message, 
+                                        process_text_message, 
                                         sender_id, 
                                         message_text
+                                    )
+                                
+                                elif message.get("type") == "audio" or message.get("type") == "voice":
+                                    # Process audio/voice message
+                                    media_id = message[message["type"]]["id"]
+                                    logger.info(f"Voice message from {sender_id}, media ID: {media_id}")
+                                    
+                                    # Process the audio in the background
+                                    background_tasks.add_task(
+                                        process_audio_message,
+                                        sender_id,
+                                        media_id
                                     )
         
         # Always return a 200 OK response to acknowledge receipt
@@ -178,6 +228,8 @@ if __name__ == "__main__":
         missing_vars.append("WHATSAPP_TOKEN")
     if not WHATSAPP_VERIFY_TOKEN:
         missing_vars.append("WHATSAPP_VERIFY_TOKEN")
+    if not OPENAI_API_KEY:
+        missing_vars.append("OPENAI_API_KEY")
     
     if missing_vars:
         logger.warning(f"Missing environment variables: {', '.join(missing_vars)}")
