@@ -152,6 +152,74 @@ def send_whatsapp_message(to: str, message: str):
         logger.error(f"Error sending WhatsApp message: {e}")
         return None
 
+def detect_image_generation_intent(message_text: str) -> tuple[bool, str]:
+    """Detect if a message is asking for image generation and extract the prompt.
+    
+    Returns:
+        tuple: (is_image_request, image_prompt)
+    """
+    # First check for the explicit /image command
+    if message_text.startswith("/image"):
+        # Extract the prompt by removing '/image ' from the start
+        prompt = message_text[7:].strip()
+        return True, prompt
+    
+    # For natural language requests, use the LLM to detect intent
+    try:
+        # Initialize LLM
+        llm = get_llm_client()
+        
+        # Create system prompt for classification
+        system_prompt = """
+        You are an AI that determines if a message is asking for image generation.
+        If the message is asking you to create, generate, draw, or show an image or picture, 
+        respond with 'YES' followed by a comma and then the image description.
+        If the message is not asking for an image, respond with 'NO'.
+        
+        Examples:
+        Input: "Generate an image of a cat"
+        Output: YES, a cat
+        
+        Input: "Show me a picture of mountains at sunset"
+        Output: YES, mountains at sunset
+        
+        Input: "How does photosynthesis work?"
+        Output: NO
+        
+        Input: "Can you draw a forest?"
+        Output: YES, a forest
+        
+        Keep your response format strictly as:  
+        YES, [image description]   
+        or just:  
+        NO
+        """
+        
+        # Generate response using LLM
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=message_text)
+        ]
+        
+        response = llm.invoke(messages)
+        result = response.content.strip()
+        
+        # Parse the response
+        if result.upper().startswith("YES"):
+            parts = result.split(",", 1)
+            if len(parts) > 1:
+                return True, parts[1].strip()
+            else:
+                # If the format is not as expected, use the original message as prompt
+                return True, message_text
+        else:
+            return False, ""
+            
+    except Exception as e:
+        logger.error(f"Error detecting image intent: {e}")
+        # Default to not an image request on error
+        return False, ""
+
 def get_groq_response(message_text: str) -> str:
     """Generate a response using the Groq LLM"""
     try:
@@ -265,22 +333,23 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     # Get the message text
                                     message_text = message["text"]["body"]
                                     
-                                    # Check if this is an image generation command
-                                    if message_text.startswith("/image"):
-                                        prompt = message_text[7:].strip()  # Remove '/image ' from the start
-                                        logger.info(f"Image generation request from {sender_id}: {prompt}")
+                                    # Check if this is an image generation request (either with /image or natural language)
+                                    is_image_request, image_prompt = detect_image_generation_intent(message_text)
+                                    
+                                    if is_image_request:
+                                        logger.info(f"Image generation request from {sender_id}: {image_prompt}")
                                         
-                                        if not prompt:
+                                        if not image_prompt:
                                             send_whatsapp_message(
                                                 sender_id, 
-                                                "Please provide a prompt after /image. Example: /image a beautiful sunset over mountains"
+                                                "Please describe what kind of image you'd like me to generate."
                                             )
                                         else:
                                             # Process the image generation in the background
                                             background_tasks.add_task(
                                                 process_image_generation,
                                                 sender_id,
-                                                prompt
+                                                image_prompt
                                             )
                                     else:
                                         # Process regular text message
@@ -329,8 +398,8 @@ def process_image_generation(sender_id: str, prompt: str):
         media_id = upload_whatsapp_media(image_path)
         logger.info(f"Uploaded image to WhatsApp, media ID: {media_id}")
         
-        # Send the image to the user
-        send_whatsapp_image(sender_id, media_id, f"Image generated from: {prompt}")
+        # Send the image to the user without a caption
+        send_whatsapp_image(sender_id, media_id, "")
         logger.info(f"Image sent to {sender_id}")
         
         # Clean up the temporary file
