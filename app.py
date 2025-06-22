@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 from typing import Dict, Any
 from dotenv import load_dotenv
 import requests
@@ -15,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 # Import custom modules
 import stt
 import text_to_image
+import image_to_text
 
 # Load environment variables
 load_dotenv()
@@ -123,8 +125,15 @@ def send_whatsapp_image(to: str, image_id: str, caption: str = ""):
         raise ValueError(f"Error sending image: {str(e)}")
 
 
-def send_whatsapp_message(to: str, message: str):
-    """Send a message to WhatsApp user"""
+def send_whatsapp_message(to: str, message: str, max_retries: int = 3, retry_delay: int = 2):
+    """Send a message to WhatsApp user with retry mechanism
+    
+    Args:
+        to: Recipient's phone number
+        message: Message content
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay in seconds between retries
+    """
     if not all([WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
         logger.error("WhatsApp credentials are not set")
         return
@@ -143,14 +152,29 @@ def send_whatsapp_message(to: str, message: str):
         "text": {"body": message}
     }
     
-    try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        logger.info(f"Message sent successfully to {to}")
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error sending WhatsApp message: {e}")
-        return None
+    retry_count = 0
+    last_exception = None
+    
+    while retry_count <= max_retries:
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=10)
+            response.raise_for_status()
+            logger.info(f"Message sent successfully to {to}")
+            return True
+        except requests.exceptions.RequestException as e:
+            last_exception = e
+            retry_count += 1
+            if retry_count <= max_retries:
+                logger.warning(f"WhatsApp message send attempt {retry_count} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                # Increase delay exponentially for next retry
+                retry_delay *= 2
+            else:
+                break
+    
+    logger.error(f"Error sending WhatsApp message after {max_retries} retries: {str(last_exception)}")
+    return False
+
 
 def detect_image_generation_intent(message_text: str) -> tuple[bool, str]:
     """Detect if a message is asking for image generation and extract the prompt.
@@ -373,6 +397,18 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                         sender_id,
                                         media_id
                                     )
+                                
+                                elif message.get("type") == "image":
+                                    # Process image message
+                                    media_id = message["image"]["id"]
+                                    logger.info(f"Image message from {sender_id}, media ID: {media_id}")
+                                    
+                                    # Process the image in the background
+                                    background_tasks.add_task(
+                                        process_image_message,
+                                        sender_id,
+                                        media_id
+                                    )
         
         # Always return a 200 OK response to acknowledge receipt
         return JSONResponse(content={"status": "received"})
@@ -410,8 +446,31 @@ def process_image_generation(sender_id: str, prompt: str):
             logger.warning(f"Failed to remove temporary image file: {e}")
     
     except Exception as e:
-        logger.error(f"Error processing image generation: {e}")
-        send_whatsapp_message(sender_id, f"Sorry, I couldn't generate your image. Error: {str(e)}")
+        logger.error(f"Error generating image: {e}")
+        send_whatsapp_message(sender_id, f"I'm sorry, I couldn't generate that image: {str(e)}")
+
+
+def process_image_message(sender_id: str, media_id: str):
+    """Process an image received from the user and send back a description."""
+    try:
+        # Send a message indicating that image analysis is in progress
+        send_whatsapp_message(sender_id, "Analyzing your image... Please wait.")
+        
+        # Get WhatsApp token from environment
+        whatsapp_token = os.getenv("WHATSAPP_TOKEN")
+        if not whatsapp_token:
+            raise ValueError("WHATSAPP_TOKEN environment variable is not set")
+            
+        # Process the image using image_to_text module
+        description = image_to_text.process_image_file(media_id, whatsapp_token)
+        
+        # Send the description back to the user
+        send_whatsapp_message(sender_id, description)
+        logger.info(f"Image analysis sent to {sender_id}")
+        
+    except Exception as e:
+        logger.error(f"Error processing image message: {e}")
+        send_whatsapp_message(sender_id, f"I'm sorry, I couldn't analyze that image: {str(e)}")
 
 
 if __name__ == "__main__":
