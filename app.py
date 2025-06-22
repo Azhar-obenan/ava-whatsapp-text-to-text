@@ -17,6 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import stt
 import text_to_image
 import image_to_text
+import whatsapp_utils
 
 # Load environment variables
 load_dotenv()
@@ -349,8 +350,12 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     for change in entry["changes"]:
                         if "value" in change and "messages" in change["value"]:
                             for message in change["value"]["messages"]:
-                                # Extract sender ID
+                                # Extract sender ID and message ID
                                 sender_id = message["from"]
+                                message_id = message["id"]
+                                
+                                # Mark the message as read (blue tick)
+                                background_tasks.add_task(whatsapp_utils.mark_message_as_read, message_id)
                                 
                                 # Handle different message types
                                 if message.get("type") == "text":
