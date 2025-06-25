@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 # Import custom modules
 import stt
+import tts
 import text_to_image
 import image_to_text
 import whatsapp_utils
@@ -35,6 +36,7 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVENLAB_API_KEY = os.getenv("ELEVENLAB_API_KEY")
 
 # Initialize LLM client
 def get_llm_client():
@@ -48,6 +50,51 @@ def get_llm_client():
         temperature=0.7,
         groq_api_key=GROQ_API_KEY
     )
+
+def send_whatsapp_audio(to: str, file_path: str):
+    """Send an audio message to a WhatsApp user"""
+    if not all([WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
+        logger.error("WhatsApp credentials not set")
+        raise ValueError("WhatsApp credentials not set")
+    
+    try:
+        # First upload the audio file
+        media_id = upload_whatsapp_media(file_path, mime_type="audio/mpeg")
+        
+        if not media_id:
+            logger.error("Failed to upload audio file")
+            return False
+        
+        # API endpoint for sending messages
+        url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+        
+        # Prepare the request payload
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "audio",
+            "audio": {
+                "id": media_id
+            }
+        }
+        
+        # Send the request
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+        
+        logger.info(f"Audio sent successfully to {to}")
+        return response.json()
+    
+    except Exception as e:
+        logger.error(f"Error sending audio via WhatsApp: {e}")
+        raise ValueError(f"Error sending audio: {str(e)}")
+
 
 def upload_whatsapp_media(file_path: str, mime_type: str = "image/jpeg"):
     """Upload a media file to WhatsApp servers and return the media ID"""
@@ -177,6 +224,43 @@ def send_whatsapp_message(to: str, message: str, max_retries: int = 3, retry_del
     return False
 
 
+def send_whatsapp_typing_status(recipient_id: str, status_type: str = "typing"):
+    """Send typing status to a WhatsApp user
+    
+    Args:
+        recipient_id: The WhatsApp ID of the recipient
+        status_type: The type of status ('typing' or 'recording')
+    """
+    if not all([WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TOKEN]):
+        logger.error("WhatsApp credentials are not set")
+        return False
+    
+    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}"
+    }
+    
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_id,
+        "type": status_type
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning(f"Error sending typing status: {e}")
+        return False
+
+
+
+
+
 def detect_image_generation_intent(message_text: str) -> tuple[bool, str]:
     """Detect if a message is asking for image generation and extract the prompt.
     
@@ -270,13 +354,34 @@ def get_groq_response(message_text: str) -> str:
         return "I'm sorry, I'm having trouble processing your request right now."
 
 def process_text_message(sender_id: str, message_text: str):
-    """Process incoming text message and generate a response"""
+    """Process incoming text message and generate a response
+    
+    Args:
+        sender_id: The WhatsApp ID of the sender
+        message_text: The message text from the user
+    """
     try:
         # Generate response using LLM
         response_text = get_groq_response(message_text)
         
-        # Send the response back to the user
-        send_whatsapp_message(sender_id, response_text)
+        # Always use TTS for all responses if the API key is available
+        if ELEVENLAB_API_KEY:
+            # Send a typing indicator while generating audio
+            send_whatsapp_typing_status(sender_id)
+            
+            # Convert text to speech
+            audio_path = tts.text_to_speech(response_text)
+            
+            # Send audio response if successfully generated
+            if audio_path:
+                send_whatsapp_audio(sender_id, audio_path)
+            else:
+                # Only send text if audio generation failed
+                logger.warning("Failed to generate audio, falling back to text")
+                send_whatsapp_message(sender_id, response_text)
+        else:
+            # If no ElevenLabs API key available, just send text
+            send_whatsapp_message(sender_id, response_text)
     except Exception as e:
         logger.error(f"Error processing text message: {e}")
         # Send an error message to the user
@@ -292,14 +397,31 @@ def process_audio_message(sender_id: str, media_id: str):
         transcript = stt.process_voice_message(media_id, WHATSAPP_TOKEN)
         logger.info(f"Transcription: {transcript}")
         
+        response_text = ""
         if transcript:
             # Generate response to the transcribed text
             response_text = get_groq_response(transcript)
-            
-            # Send the response back to the user
-            send_whatsapp_message(sender_id, response_text)
         else:
-            send_whatsapp_message(sender_id, "I couldn't understand your voice message. Could you please try again?")
+            response_text = "I couldn't understand your voice message. Could you please try again?"
+        
+        # Convert response to speech and send audio
+        if ELEVENLAB_API_KEY and response_text:
+            # Send a typing indicator while generating audio
+            send_whatsapp_typing_status(sender_id)
+            
+            # Convert text to speech
+            audio_path = tts.text_to_speech(response_text)
+            
+            # Send audio response if successfully generated
+            if audio_path:
+                send_whatsapp_audio(sender_id, audio_path)
+            else:
+                # Fall back to text if audio generation fails
+                logger.warning("Failed to generate audio for voice message response, falling back to text")
+                send_whatsapp_message(sender_id, response_text)
+        else:
+            # If no ElevenLabs API key available, just send text
+            send_whatsapp_message(sender_id, response_text)
     except Exception as e:
         logger.error(f"Error processing audio message: {e}")
         # Send an error message to the user
@@ -365,6 +487,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     # Check if this is an image generation request (either with /image or natural language)
                                     is_image_request, image_prompt = detect_image_generation_intent(message_text)
                                     
+
                                     if is_image_request:
                                         logger.info(f"Image generation request from {sender_id}: {image_prompt}")
                                         
@@ -429,19 +552,54 @@ def process_image_generation(sender_id: str, prompt: str):
     """Process image generation request and send image back to user"""
     try:
         # Send a message indicating that image generation is in progress
-        send_whatsapp_message(sender_id, "Generating your image... Please wait.")
+        send_whatsapp_typing_status(sender_id)
         
         # Generate the image using the Text-to-Image module
         _, image_path = text_to_image.generate_image_from_prompt(prompt)
         logger.info(f"Generated image at path: {image_path}")
         
+        if not image_path or not os.path.exists(image_path):
+            response_text = "I'm sorry, I couldn't generate an image based on that prompt. Could you try a different description?"
+            
+            # Convert response text to speech
+            if ELEVENLAB_API_KEY:
+                audio_path = tts.text_to_speech(response_text)
+                if audio_path:
+                    send_whatsapp_audio(sender_id, audio_path)
+                else:
+                    send_whatsapp_message(sender_id, response_text)
+            else:
+                send_whatsapp_message(sender_id, response_text)
+            return
+        
         # Upload the image to WhatsApp's servers
         media_id = upload_whatsapp_media(image_path)
         logger.info(f"Uploaded image to WhatsApp, media ID: {media_id}")
         
-        # Send the image to the user without a caption
-        send_whatsapp_image(sender_id, media_id, "")
+        if not media_id:
+            response_text = "I wasn't able to share the generated image due to a technical issue."
+            
+            # Convert response text to speech
+            if ELEVENLAB_API_KEY:
+                audio_path = tts.text_to_speech(response_text)
+                if audio_path:
+                    send_whatsapp_audio(sender_id, audio_path)
+                else:
+                    send_whatsapp_message(sender_id, response_text)
+            else:
+                send_whatsapp_message(sender_id, response_text)
+            return
+        
+        # Send the image to the user with a caption
+        send_whatsapp_image(sender_id, media_id, caption=f"Image based on: {prompt}")
         logger.info(f"Image sent to {sender_id}")
+        
+        # Also send audio response
+        response_text = f"I've created an image based on: {prompt}"
+        if ELEVENLAB_API_KEY:
+            audio_path = tts.text_to_speech(response_text)
+            if audio_path:
+                send_whatsapp_audio(sender_id, audio_path)
         
         # Clean up the temporary file
         try:
@@ -452,30 +610,71 @@ def process_image_generation(sender_id: str, prompt: str):
     
     except Exception as e:
         logger.error(f"Error generating image: {e}")
-        send_whatsapp_message(sender_id, f"I'm sorry, I couldn't generate that image: {str(e)}")
-
+        response_text = f"I'm sorry, I couldn't generate that image: {str(e)}"
+        
+        # Convert error message to speech
+        if ELEVENLAB_API_KEY:
+            audio_path = tts.text_to_speech(response_text)
+            if audio_path:
+                send_whatsapp_audio(sender_id, audio_path)
+            else:
+                send_whatsapp_message(sender_id, response_text)
+        else:
+            send_whatsapp_message(sender_id, response_text)
 
 def process_image_message(sender_id: str, media_id: str):
     """Process an image received from the user and send back a description."""
     try:
         # Send a message indicating that image analysis is in progress
-        send_whatsapp_message(sender_id, "Analyzing your image... Please wait.")
+        send_whatsapp_typing_status(sender_id)
         
-        # Get WhatsApp token from environment
-        whatsapp_token = os.getenv("WHATSAPP_TOKEN")
-        if not whatsapp_token:
-            raise ValueError("WHATSAPP_TOKEN environment variable is not set")
-            
         # Process the image using image_to_text module
-        description = image_to_text.process_image_file(media_id, whatsapp_token)
+        description = image_to_text.process_image_file(media_id, WHATSAPP_TOKEN)
+        logger.info(f"Image analysis completed for {sender_id}")
         
-        # Send the description back to the user
-        send_whatsapp_message(sender_id, description)
-        logger.info(f"Image analysis sent to {sender_id}")
+        if description:
+            response_text = description
+            
+            # Convert response to speech and send audio
+            if ELEVENLAB_API_KEY:
+                # Send audio response first
+                audio_path = tts.text_to_speech(response_text)
+                if audio_path:
+                    send_whatsapp_audio(sender_id, audio_path)
+                else:
+                    # Fall back to text if audio generation fails
+                    send_whatsapp_message(sender_id, response_text)
+            else:
+                # If no ElevenLabs API key available, just send text
+                send_whatsapp_message(sender_id, response_text)
+        else:
+            response_text = "I couldn't analyze that image properly. Could you try sending a clearer image?"
+            
+            # Convert error response to speech
+            if ELEVENLAB_API_KEY:
+                audio_path = tts.text_to_speech(response_text)
+                if audio_path:
+                    send_whatsapp_audio(sender_id, audio_path)
+                else:
+                    send_whatsapp_message(sender_id, response_text)
+            else:
+                send_whatsapp_message(sender_id, response_text)
         
+        logger.info(f"Image analysis response sent to {sender_id}")
+            
     except Exception as e:
         logger.error(f"Error processing image message: {e}")
-        send_whatsapp_message(sender_id, f"I'm sorry, I couldn't analyze that image: {str(e)}")
+        response_text = f"I couldn't analyze that image: {str(e)}"
+        
+        # Convert error message to speech
+        if ELEVENLAB_API_KEY:
+            audio_path = tts.text_to_speech(response_text)
+            if audio_path:
+                send_whatsapp_audio(sender_id, audio_path)
+            else:
+                send_whatsapp_message(sender_id, response_text)
+        else:
+            send_whatsapp_message(sender_id, response_text)
 
 
 if __name__ == "__main__":
@@ -491,6 +690,8 @@ if __name__ == "__main__":
         missing_vars.append("WHATSAPP_VERIFY_TOKEN")
     if not OPENAI_API_KEY:
         missing_vars.append("OPENAI_API_KEY")
+    if not ELEVENLAB_API_KEY:
+        missing_vars.append("ELEVENLAB_API_KEY")
     
     if missing_vars:
         logger.warning(f"Missing environment variables: {', '.join(missing_vars)}")
