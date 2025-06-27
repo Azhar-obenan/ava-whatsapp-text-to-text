@@ -397,12 +397,30 @@ def process_audio_message(sender_id: str, media_id: str):
         transcript = stt.process_voice_message(media_id, WHATSAPP_TOKEN)
         logger.info(f"Transcription: {transcript}")
         
-        response_text = ""
-        if transcript:
-            # Generate response to the transcribed text
-            response_text = get_groq_response(transcript)
-        else:
+        if not transcript:
             response_text = "I couldn't understand your voice message. Could you please try again?"
+            # Send text response
+            send_whatsapp_message(sender_id, response_text)
+            return
+            
+        # Check if this is an image generation request
+        is_image_request, image_prompt = detect_image_generation_intent(transcript)
+        logger.info(f"Audio transcription image detection: is_image_request={is_image_request}, prompt={image_prompt}")
+        
+        if is_image_request:
+            # Handle as image generation request
+            if not image_prompt:
+                send_whatsapp_message(
+                    sender_id, 
+                    "Please describe what kind of image you'd like me to generate."
+                )
+            else:
+                # Process the image generation in the background
+                process_image_generation(sender_id, image_prompt)
+            return
+            
+        # Process as regular text response
+        response_text = get_groq_response(transcript)
         
         # Convert response to speech and send audio
         if ELEVENLAB_API_KEY and response_text:
